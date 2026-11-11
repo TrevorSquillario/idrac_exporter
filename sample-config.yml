@@ -151,3 +151,10 @@ metrics:
       maxage: 7d         # CONFIG_METRICS_MANAGER_EVENTS_MAXAGE=7d
   extra:
     enabled: false       # CONFIG_METRICS_EXTRA_ENABLED=false
+
+# The metric_reports section is used to specify individual metric reports to be collected.
+# The names of the metric reports can be found in the iDRAC documentation or from
+# /redfish/v1/TelemetryService/MetricReportDefinitions
+
+metric_reports:
+  - StorageDiskSMARTData

@@ -988,3 +988,38 @@ type PowerDistributionMetrics struct {
 		Reading       float64 `json:"Reading"`
 	} `json:"EnergykWh"`
 }
+
+type MetricReportResponse struct {
+	Id           string              `json:"Id"`
+	MetricValues []MetricReportValue `json:"MetricValues"`
+}
+
+type MetricReportValue struct {
+	MetricId string `json:"MetricId"`
+	// MetricValue can be either a JSON string or a numeric value depending
+	// on implementation (e.g. iDRAC often uses strings, while other
+	// implementations may emit numbers). Use an interface{} so unmarshalling
+	// preserves whatever form the server returns and parsing can normalize
+	// it later.
+	MetricValue interface{} `json:"MetricValue"`
+	// MetricDefinition (optional) provides a link to the metric definition
+	// resource which some implementations include.
+	MetricDefinition *struct {
+		OdataId string `json:"@odata.id"`
+	} `json:"MetricDefinition,omitempty"`
+	// Timestamp is optional on some implementations.
+	Timestamp string `json:"Timestamp,omitempty"`
+
+	// MetricProperty is optional in some implementations (e.g. HPE iLO).
+	// Use a pointer so we can distinguish "absent" (nil) from present
+	// but empty ("").
+	MetricProperty *string `json:"MetricProperty"`
+	Oem            *struct {
+		Dell *struct {
+			ContextID string `json:"ContextID"`
+			FQDD      string `json:"FQDD"`
+			Label     string `json:"Label"`
+			Source    string `json:"Source"`
+		} `json:"Dell"`
+	} `json:"Oem"`
+}

@@ -1,7 +1,9 @@
 package collector
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"path"
 	"regexp"
 	"slices"
@@ -9,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/mrlhansen/idrac_exporter/internal/config"
+	"github.com/mrlhansen/idrac_exporter/internal/log"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -47,6 +50,7 @@ type Client struct {
 		Processors       string
 		Manager          string
 		ManagerEvent     string
+		TelemetryService string
 		Extra            []string
 		RackPDUs         []string
 	}
@@ -199,6 +203,10 @@ func (client *Client) findAllEndpoints() bool {
 	client.path.PowerSubsystem = chassis.PowerSubsystem.OdataId
 	client.path.Processors = system.Processors.OdataId
 	client.path.Sensors = chassis.Sensors.OdataId
+	// TelemetryService is optional: not every BMC exposes it, and metric
+	// reports may be absent even when it does. Record the path (empty when
+	// unavailable) so metric report collection can skip cleanly.
+	client.path.TelemetryService = root.TelemetryService.OdataId
 
 	// Vendor
 	m := strings.ToLower(system.Manufacturer)
@@ -1229,4 +1237,210 @@ func (client *Client) RefreshPDUs(mc *Collector, ch chan<- prometheus.Metric) bo
 	}
 
 	return result
+}
+
+// buildMetricEntryKey returns an escaped composite key for deduplication
+// of MetricReport entries. The key combines metricId and context, separating
+// them with '|' and using "<nil>" to distinguish a nil context from an empty
+// string. The combined string is url.PathEscape'd to safely escape special
+// characters such as spaces, slashes, and colons.
+func buildMetricEntryKey(metricId string, parts ...*string) string {
+	// Build a composite dedupe key by joining metricId with the provided
+	// parts, using "<nil>" to distinguish nil from empty strings.
+	sb := strings.Builder{}
+	sb.WriteString(metricId)
+	for _, p := range parts {
+		sb.WriteByte('|')
+		if p == nil {
+			sb.WriteString("<nil>")
+		} else {
+			sb.WriteString(*p)
+		}
+	}
+	return sb.String()
+}
+
+// parseMetricValue normalizes a MetricReportValue's MetricValue to a float64.
+// Accepts string or numeric JSON values. String values are additionally
+// normalized so boolean-like and status strings map to numeric codes.
+//
+// Priority (checked in this order):
+//  1. explicit keywords 'released'/'set' -> 0/1
+//  2. health/status keywords: OK=0, Degraded=1, Critical=3, Unknown=4
+//  3. true/false -> 1/0
+//  4. on/off prefixes -> 1/0
+//  5. numeric parse as float
+func parseMetricValue(mv MetricReportValue) (float64, error) {
+	if mv.MetricValue == nil {
+		return 0, fmt.Errorf("nil metric value")
+	}
+	switch v := mv.MetricValue.(type) {
+	case string:
+		if v == "" {
+			return 0, fmt.Errorf("empty string metric value")
+		}
+		sv := strings.TrimSpace(v)
+		sl := strings.ToLower(sv)
+		// Map explicit 'released'/'set' first (Dell LCLog etc.)
+		if strings.Contains(sl, "released") {
+			return 0, nil
+		}
+		if strings.Contains(sl, "set") {
+			return 1, nil
+		}
+
+		// Map common health/status strings to numeric codes.
+		// Be permissive and match substrings to handle variations like
+		// "OK (some info)" or "Degraded: reason".
+		if strings.Contains(sl, "unknown") {
+			return 4, nil
+		}
+		if strings.Contains(sl, "ok") {
+			return 0, nil
+		}
+		if strings.Contains(sl, "degraded") {
+			return 1, nil
+		}
+		if strings.Contains(sl, "critical") {
+			return 3, nil
+		}
+		if sl == "true" {
+			return 1, nil
+		}
+		if sl == "false" {
+			return 0, nil
+		}
+		if strings.HasPrefix(sl, "on") {
+			return 1, nil
+		}
+		if strings.HasPrefix(sl, "off") {
+			return 0, nil
+		}
+
+		return strconv.ParseFloat(sv, 64)
+	case bool:
+		if v {
+			return 1, nil
+		}
+		return 0, nil
+	case float64:
+		return v, nil
+	case int:
+		return float64(v), nil
+	case json.Number:
+		return v.Float64()
+	default:
+		// Fallback: try to stringify then parse.
+		s := fmt.Sprintf("%v", v)
+		if s == "" || s == "<nil>" {
+			return 0, fmt.Errorf("unsupported metric value type: %T", v)
+		}
+		return strconv.ParseFloat(s, 64)
+	}
+}
+
+// RefreshMetricReport fetches a single Redfish TelemetryService MetricReport by
+// name and emits one Prometheus metric per unique (metricId, contextId) pair.
+//
+// A MetricReport may contain multiple entries for the same metric captured at
+// different timestamps (e.g. a rolling buffer of readings). Iterating the slice
+// in order and overwriting the map entry on each pass means only the last —
+// i.e. the newest — value is retained before any metrics are emitted.
+//
+// The contextId is taken from the Dell OEM ContextID field when present; it
+// falls back to the standard MetricProperty URI otherwise.
+//
+// A missing TelemetryService is not an error: telemetry is optional and may be
+// disabled on the BMC, so the report is skipped quietly. If the TelemetryService
+// exists but the requested MetricReport does not, a warning is logged and the
+// report is skipped. In both cases true is returned so the rest of the scrape
+// continues.
+func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- prometheus.Metric) bool {
+	// Skip entirely when the BMC does not advertise a TelemetryService.
+	if client.path.TelemetryService == "" {
+		log.Debug("TelemetryService not available, skipping MetricReport %s", name)
+		return true
+	}
+
+	path := strings.TrimSuffix(client.path.TelemetryService, "/") + "/MetricReports/" + name
+	resp := MetricReportResponse{}
+	ok, status := client.redfish.GetOptional(path, &resp)
+	if !ok {
+		// A 404 means the TelemetryService exists but this particular report
+		// does not (e.g. telemetry is not enabled for it). Warn and continue so
+		// the rest of the scrape is unaffected. Any other failure is a real
+		// error and is reported to the caller so it counts towards scrape
+		// errors.
+		if status == http.StatusNotFound {
+			log.Warn("MetricReport %s not available, skipping", name)
+			return true
+		}
+		log.Warn("failed to GET MetricReport %s", path)
+		return false
+	}
+
+	// Deduplicate entries by a composite key (metricId + context), keeping
+	// the last value seen. We key the map by an escaped string produced by
+	// buildMetricEntryKey so special characters don't collide. metricVal
+	// stores the original metricId and ctx pointer for emission.
+	type metricVal struct {
+		metricId string
+		value    float64
+		ctx      *string
+		fqdd     *string
+		label    *string
+		source   *string
+	}
+	latest := map[string]metricVal{}
+
+	report_id := resp.Id
+	for _, mv := range resp.MetricValues {
+		if mv.MetricId == "" {
+			continue
+		}
+		value, err := parseMetricValue(mv)
+		if err != nil {
+			fmt.Printf("failed to parse MetricValue '%v' for MetricId '%s' in report '%s': %v\n", mv.MetricValue, mv.MetricId, report_id, err)
+			continue
+		}
+
+		// Determine contextId preference: Dell OEM ContextID wins, otherwise
+		// MetricProperty if present. If neither exists the context is nil.
+		var ctxPtr *string
+		var fqddPtr *string
+		var labelPtr *string
+		var sourcePtr *string
+		if mv.Oem != nil && mv.Oem.Dell != nil {
+			if mv.Oem.Dell.ContextID != "" {
+				s := mv.Oem.Dell.ContextID
+				ctxPtr = &s
+			}
+			if mv.Oem.Dell.FQDD != "" {
+				s := mv.Oem.Dell.FQDD
+				fqddPtr = &s
+			}
+			if mv.Oem.Dell.Label != "" {
+				s := mv.Oem.Dell.Label
+				labelPtr = &s
+			}
+			if mv.Oem.Dell.Source != "" {
+				s := mv.Oem.Dell.Source
+				sourcePtr = &s
+			}
+		}
+		if ctxPtr == nil && mv.MetricProperty != nil {
+			// MetricProperty may be absent (nil) on some implementations (HPE
+			// iLO). If present, use its value even if empty.
+			ctxPtr = mv.MetricProperty
+		}
+
+		key := buildMetricEntryKey(mv.MetricId, ctxPtr, fqddPtr)
+		latest[key] = metricVal{metricId: mv.MetricId, value: value, ctx: ctxPtr, fqdd: fqddPtr, label: labelPtr, source: sourcePtr}
+	}
+
+	for _, mv := range latest {
+		mc.NewMetricReportEntry(ch, resp.Id, mv.metricId, mv.ctx, mv.fqdd, mv.label, mv.value)
+	}
+
+	return true
 }

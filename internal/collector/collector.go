@@ -134,6 +134,9 @@ type Collector struct {
 	PduPowerApparentVA *prometheus.Desc
 	PduPowerFactor     *prometheus.Desc
 	PduEnergyKWh       *prometheus.Desc
+
+	// Metric reports
+	MetricReport *prometheus.Desc
 }
 
 func NewCollector() *Collector {
@@ -544,6 +547,11 @@ func NewCollector() *Collector {
 			"Energy consumption in kWh",
 			[]string{"id"}, nil,
 		),
+		MetricReport: prometheus.NewDesc(
+			prometheus.BuildFQName(prefix, "", "metric_report"),
+			"Value from a Redfish TelemetryService metric report",
+			[]string{"metric_report_id", "metric_id", "context_id"}, nil,
+		),
 	}
 
 	collector.builder = new(strings.Builder)
@@ -635,6 +643,7 @@ func (collector *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collector.PduPowerApparentVA
 	ch <- collector.PduPowerFactor
 	ch <- collector.PduEnergyKWh
+	ch <- collector.MetricReport
 }
 
 func (collector *Collector) CollectServer(ch chan<- prometheus.Metric) {
@@ -734,6 +743,15 @@ func (collector *Collector) CollectServer(ch chan<- prometheus.Metric) {
 	if metrics.Extra.Enabled {
 		wg.Go(func() {
 			ok := collector.client.RefreshDell(collector, ch)
+			if !ok {
+				collector.errors.Add(1)
+			}
+		})
+	}
+
+	for _, name := range config.Config.MetricReports {
+		wg.Go(func() {
+			ok := collector.client.RefreshMetricReport(name, collector, ch)
 			if !ok {
 				collector.errors.Add(1)
 			}

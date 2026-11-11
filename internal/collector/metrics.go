@@ -5,7 +5,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/mrlhansen/idrac_exporter/internal/config"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -1066,4 +1068,122 @@ func (mc *Collector) NewPduEnergyKWh(ch chan<- prometheus.Metric, id string, m *
 		float64(m.EnergykWh.Reading),
 		id,
 	)
+}
+
+func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricReportId, metricId string, contextId, fqdd, label *string, value float64) {
+	// Convert nil pointers to empty strings for label values.
+	ctx := ""
+	if contextId != nil {
+		ctx = *contextId
+	}
+	fq := ""
+	if fqdd != nil {
+		fq = *fqdd
+	}
+	lab := ""
+	if label != nil {
+		lab = *label
+	}
+	// source removed — not emitted as a label
+
+	mid := sanitizeMetricName(metricId)
+
+	// Build metric family name as: <prefix>_telemetry_<metricId>
+	parts := []string{}
+	if p := sanitizeMetricName(config.Config.MetricsPrefix); p != "" {
+		parts = append(parts, p)
+		parts = append(parts, "telemetry")
+	}
+	if mid != "" {
+		parts = append(parts, mid)
+	}
+	fqName := strings.Join(parts, "_")
+
+	// Determine help kind based on metricId so help strings are meaningful
+	// (e.g. temperature metrics are "ThermalSensor", rpm/speed use "Sensor").
+	helpKind := metricHelpKind(metricId)
+	desc := prometheus.NewDesc(
+		fqName,
+		fmt.Sprintf("Metric report %s %s", helpKind, metricId),
+		[]string{"metric_report_id", "context", "fqdd", "label"},
+		nil,
+	)
+
+	ch <- prometheus.MustNewConstMetric(
+		desc,
+		prometheus.GaugeValue,
+		value,
+		metricReportId,
+		ctx,
+		fq,
+		lab,
+	)
+}
+
+// sanitizeMetricName converts an arbitrary string to a valid Prometheus
+// metric name: lowercase, replace non-alphanumeric characters with '_',
+// collapse repeated underscores and trim leading digits/underscores.
+func sanitizeMetricName(s string) string {
+	// First convert CamelCase boundaries to underscores, then lowercase.
+	s = camelToSnake(s)
+	s = strings.ToLower(s)
+	// replace non alnum with '_'
+	var b strings.Builder
+	prevUnderscore := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevUnderscore = false
+		} else {
+			if !prevUnderscore {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	out := b.String()
+	// trim leading/trailing underscores
+	out = strings.Trim(out, "_")
+	// ensure it doesn't start with digit
+	if out == "" {
+		out = "metric"
+	} else if out[0] >= '0' && out[0] <= '9' {
+		out = "m_" + out
+	}
+	return out
+}
+
+// camelToSnake inserts underscores at CamelCase boundaries (e.g.
+// "TemperatureReading" -> "Temperature_Reading", "RPMReading" -> "RPM_Reading").
+func camelToSnake(s string) string {
+	var b strings.Builder
+	runes := []rune(s)
+	for i, r := range runes {
+		if i > 0 && unicode.IsUpper(r) {
+			prev := runes[i-1]
+			var next rune
+			if i+1 < len(runes) {
+				next = runes[i+1]
+			}
+			if unicode.IsLower(prev) || unicode.IsDigit(prev) {
+				b.WriteRune('_')
+			} else if unicode.IsUpper(prev) && next != 0 && unicode.IsLower(next) {
+				b.WriteRune('_')
+			}
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// metricHelpKind maps a metricId to a short kind used in help strings.
+func metricHelpKind(metricId string) string {
+	m := strings.ToLower(metricId)
+	if strings.Contains(m, "temp") || strings.Contains(m, "temperature") {
+		return "ThermalSensor"
+	}
+	if strings.Contains(m, "rpm") || strings.Contains(m, "speed") || strings.Contains(m, "rate") {
+		return "Sensor"
+	}
+	return "Sensor"
 }
