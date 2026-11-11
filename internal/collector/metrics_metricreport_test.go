@@ -2,6 +2,7 @@ package collector
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/mrlhansen/idrac_exporter/internal/config"
@@ -140,6 +141,44 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				}
 			default:
 				t.Fatalf("no metric emitted for case %s", c.name)
+			}
+		})
+	}
+}
+
+func TestParseMetricValue_StateStrings(t *testing.T) {
+	cases := []struct {
+		in       interface{}
+		expected float64
+	}{
+		{"Down", 0},
+		{"down", 0},
+		{"Up", 1},
+		{"UP", 1},
+		{"Operational", 1},
+		{"operational", 1},
+		{"Non-operational", 0},
+		{"Non-Operational", 0},
+		{"NonOperational", 0},
+		{"Non operational", 0},
+		{"OK", 0},
+		{"Degraded", 1},
+		{"Critical", 3},
+		{"Unknown", 4},
+		{"true", 1},
+		{"false", 0},
+		{"507", 507},
+		{507.0, 507},
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%v", c.in), func(t *testing.T) {
+			mv := MetricReportValue{MetricId: "Test", MetricValue: c.in}
+			got, err := parseMetricValue(mv)
+			if err != nil {
+				t.Fatalf("parse error for %v: %v", c.in, err)
+			}
+			if got != c.expected {
+				t.Fatalf("expected %v for %v, got %v", c.expected, c.in, got)
 			}
 		})
 	}

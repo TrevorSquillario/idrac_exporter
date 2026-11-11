@@ -2,6 +2,7 @@ package collector
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path"
@@ -9,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mrlhansen/idrac_exporter/internal/config"
 	"github.com/mrlhansen/idrac_exporter/internal/log"
@@ -1260,32 +1262,59 @@ func buildMetricEntryKey(metricId string, parts ...*string) string {
 	return sb.String()
 }
 
+// errNoMetricValue is returned by parseMetricValue when a MetricReportValue
+// carries no value at all (nil or an empty/whitespace-only string). This is
+// normal for some reports (e.g. CPURegistersBuffer) and is not an error
+// condition, so callers can skip such entries quietly.
+var errNoMetricValue = errors.New("no metric value")
+
 // parseMetricValue normalizes a MetricReportValue's MetricValue to a float64.
 // Accepts string or numeric JSON values. String values are additionally
-// normalized so boolean-like and status strings map to numeric codes.
+// normalized so boolean-like and status strings map to numeric codes, and
+// RFC3339 timestamps are converted to Unix seconds.
 //
 // Priority (checked in this order):
 //  1. explicit keywords 'released'/'set' -> 0/1
-//  2. health/status keywords: OK=0, Degraded=1, Critical=3, Unknown=4
-//  3. true/false -> 1/0
-//  4. on/off prefixes -> 1/0
-//  5. numeric parse as float
+//  2. link/driver state keywords: Down=0, Up=1, Non-operational=0, Operational=1
+//  3. health/status keywords: OK=0, Degraded=1, Critical=3, Unknown=4
+//  4. true/false -> 1/0
+//  5. on/off prefixes -> 1/0
+//  6. numeric parse as float
+//  7. RFC3339 timestamp -> Unix seconds
+//
+// An empty or nil value returns errNoMetricValue; any other unrepresentable
+// value returns a descriptive error.
 func parseMetricValue(mv MetricReportValue) (float64, error) {
 	if mv.MetricValue == nil {
-		return 0, fmt.Errorf("nil metric value")
+		return 0, errNoMetricValue
 	}
 	switch v := mv.MetricValue.(type) {
 	case string:
-		if v == "" {
-			return 0, fmt.Errorf("empty string metric value")
-		}
 		sv := strings.TrimSpace(v)
+		if sv == "" {
+			return 0, errNoMetricValue
+		}
 		sl := strings.ToLower(sv)
 		// Map explicit 'released'/'set' first (Dell LCLog etc.)
 		if strings.Contains(sl, "released") {
 			return 0, nil
 		}
 		if strings.Contains(sl, "set") {
+			return 1, nil
+		}
+
+		// Map link/driver state strings (e.g. NICStatistics LinkStatus and
+		// OSDriverState). These are matched exactly so that unrelated values
+		// containing the same words are not misclassified. "Non-operational"
+		// must be checked before "operational" since it contains it.
+		switch sl {
+		case "down":
+			return 0, nil
+		case "up":
+			return 1, nil
+		case "non-operational", "nonoperational", "non operational":
+			return 0, nil
+		case "operational":
 			return 1, nil
 		}
 
@@ -1317,7 +1346,17 @@ func parseMetricValue(mv MetricReportValue) (float64, error) {
 			return 0, nil
 		}
 
-		return strconv.ParseFloat(sv, 64)
+		if f, err := strconv.ParseFloat(sv, 64); err == nil {
+			return f, nil
+		}
+
+		// Timestamps (e.g. LastMinuteMinPowerTime) are emitted as Unix
+		// seconds so they remain useful as gauges instead of being dropped.
+		if t, err := time.Parse(time.RFC3339Nano, sv); err == nil {
+			return float64(t.UnixNano()) / 1e9, nil
+		}
+
+		return 0, fmt.Errorf("unsupported metric value %q", sv)
 	case bool:
 		if v {
 			return 1, nil
@@ -1333,9 +1372,15 @@ func parseMetricValue(mv MetricReportValue) (float64, error) {
 		// Fallback: try to stringify then parse.
 		s := fmt.Sprintf("%v", v)
 		if s == "" || s == "<nil>" {
-			return 0, fmt.Errorf("unsupported metric value type: %T", v)
+			return 0, errNoMetricValue
 		}
-		return strconv.ParseFloat(s, 64)
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, nil
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			return float64(t.UnixNano()) / 1e9, nil
+		}
+		return 0, fmt.Errorf("unsupported metric value type %T", v)
 	}
 }
 
@@ -1400,7 +1445,16 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		}
 		value, err := parseMetricValue(mv)
 		if err != nil {
-			fmt.Printf("failed to parse MetricValue '%v' for MetricId '%s' in report '%s': %v\n", mv.MetricValue, mv.MetricId, report_id, err)
+			// Entries without a value are normal in some reports and are
+			// skipped quietly. Unrepresentable values are logged at debug
+			// level so they don't flood the log on every scrape, but they
+			// still count towards the scrape error counter.
+			if errors.Is(err, errNoMetricValue) {
+				log.Debug("skipping empty MetricValue for MetricId %s in report %s", mv.MetricId, report_id)
+			} else {
+				log.Debug("skipping unparseable MetricValue %q for MetricId %s in report %s: %v", mv.MetricValue, mv.MetricId, report_id, err)
+				mc.errors.Add(1)
+			}
 			continue
 		}
 

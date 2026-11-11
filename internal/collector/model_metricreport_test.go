@@ -2,6 +2,7 @@ package collector
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -176,13 +177,39 @@ func TestParseMetricValue_Bool(t *testing.T) {
 }
 
 func TestParseMetricValue_Errors(t *testing.T) {
-	if _, err := parseMetricValue(MetricReportValue{MetricValue: nil}); err == nil {
-		t.Fatal("expected error for nil metric value")
+	if _, err := parseMetricValue(MetricReportValue{MetricValue: nil}); !errors.Is(err, errNoMetricValue) {
+		t.Fatalf("expected errNoMetricValue for nil metric value, got %v", err)
 	}
-	if _, err := parseMetricValue(MetricReportValue{MetricValue: ""}); err == nil {
-		t.Fatal("expected error for empty string metric value")
+	if _, err := parseMetricValue(MetricReportValue{MetricValue: ""}); !errors.Is(err, errNoMetricValue) {
+		t.Fatalf("expected errNoMetricValue for empty string metric value, got %v", err)
+	}
+	if _, err := parseMetricValue(MetricReportValue{MetricValue: "   "}); !errors.Is(err, errNoMetricValue) {
+		t.Fatalf("expected errNoMetricValue for whitespace-only metric value, got %v", err)
 	}
 	if _, err := parseMetricValue(MetricReportValue{MetricValue: "not-a-number"}); err == nil {
 		t.Fatal("expected error for non-numeric string")
+	} else if errors.Is(err, errNoMetricValue) {
+		t.Fatal("non-numeric string should not be reported as errNoMetricValue")
+	}
+}
+
+func TestParseMetricValue_Timestamp(t *testing.T) {
+	cases := []struct {
+		value    string
+		expected float64
+	}{
+		{"2026-11-12T03:52:43.000Z", 1794455563},
+		{"2026-11-07T12:29:37.000Z", 1794054577},
+	}
+	for _, c := range cases {
+		t.Run(c.value, func(t *testing.T) {
+			v, err := parseMetricValue(MetricReportValue{MetricValue: c.value})
+			if err != nil {
+				t.Fatalf("parse error for %q: %v", c.value, err)
+			}
+			if v != c.expected {
+				t.Fatalf("expected %v for %q, got %v", c.expected, c.value, v)
+			}
+		})
 	}
 }
