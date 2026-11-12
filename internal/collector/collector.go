@@ -749,7 +749,7 @@ func (collector *Collector) CollectServer(ch chan<- prometheus.Metric) {
 		})
 	}
 
-	for _, name := range config.Config.MetricReports {
+	for _, name := range config.Config.TelemetryReports {
 		wg.Go(func() {
 			ok := collector.client.RefreshMetricReport(name, collector, ch)
 			if !ok {

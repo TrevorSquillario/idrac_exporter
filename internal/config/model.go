@@ -74,17 +74,17 @@ type TLSConfig struct {
 }
 
 type RootConfig struct {
-	Mutex         sync.Mutex
-	Address       string                 `yaml:"address"`
-	Port          uint                   `yaml:"port"`
-	HttpsProxy    string                 `yaml:"https_proxy"`
-	MetricsPrefix string                 `yaml:"metrics_prefix"`
-	MetricReports []string               `yaml:"metric_reports"`
-	DefaultTarget string                 `yaml:"default_target"`
-	Metrics       MetricsConfig          `yaml:"metrics"`
-	TLS           TLSConfig              `yaml:"tls"`
-	Timeout       uint                   `yaml:"timeout"`
-	Concurrency   uint                   `yaml:"concurrency"`
-	Hosts         map[string]*AuthConfig `yaml:"hosts"`
-	Groups        map[string]*AuthConfig `yaml:"groups"`
+	Mutex            sync.Mutex
+	Address          string                 `yaml:"address"`
+	Port             uint                   `yaml:"port"`
+	HttpsProxy       string                 `yaml:"https_proxy"`
+	MetricsPrefix    string                 `yaml:"metrics_prefix"`
+	TelemetryReports []string               `yaml:"telemetry_reports"`
+	DefaultTarget    string                 `yaml:"default_target"`
+	Metrics          MetricsConfig          `yaml:"metrics"`
+	TLS              TLSConfig              `yaml:"tls"`
+	Timeout          uint                   `yaml:"timeout"`
+	Concurrency      uint                   `yaml:"concurrency"`
+	Hosts            map[string]*AuthConfig `yaml:"hosts"`
+	Groups           map[string]*AuthConfig `yaml:"groups"`
 }

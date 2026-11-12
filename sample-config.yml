@@ -152,9 +152,11 @@ metrics:
   extra:
     enabled: false       # CONFIG_METRICS_EXTRA_ENABLED=false
 
-# The metric_reports section is used to specify individual metric reports to be collected.
-# The names of the metric reports can be found in the iDRAC documentation or from
+# The telemetry_reports section is used to specify individual telemetry reports to be collected.
+# Typically individual telemetry reports have to be enabled first before they can be collected.
+# The names of the telemetry reports can be found at:
 # /redfish/v1/TelemetryService/MetricReportDefinitions
 
-metric_reports:
+telemetry_reports:
   - StorageDiskSMARTData
+  - ThermalSensor
