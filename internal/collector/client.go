@@ -2,6 +2,7 @@ package collector
 
 import (
 	"fmt"
+	"net/http"
 	"path"
 	"regexp"
 	"slices"
@@ -32,23 +33,25 @@ type Client struct {
 	vendor  int
 	version int
 	path    struct {
-		System           string
-		Thermal          string
-		ThermalSubsystem string
-		Power            string
-		PowerSubsystem   string
-		Sensors          string
-		Storage          string
-		SimpleStorage    string
-		SmartStorage     string
-		Memory           string
-		Network          string
-		Event            string
-		Processors       string
-		Manager          string
-		ManagerEvent     string
-		Extra            []string
-		RackPDUs         []string
+		System             string
+		Chassis            string
+		EnvironmentMetrics string
+		Thermal            string
+		ThermalSubsystem   string
+		Power              string
+		PowerSubsystem     string
+		Sensors            string
+		Storage            string
+		SimpleStorage      string
+		SmartStorage       string
+		Memory             string
+		Network            string
+		Event              string
+		Processors         string
+		Manager            string
+		ManagerEvent       string
+		Extra              []string
+		RackPDUs           []string
 	}
 	features struct {
 		ExpandLevels bool
@@ -189,6 +192,7 @@ func (client *Client) findAllEndpoints() bool {
 	}
 
 	// Paths
+	client.path.Chassis = path
 	client.path.Storage = system.Storage.OdataId
 	client.path.SimpleStorage = system.SimpleStorage.OdataId
 	client.path.Memory = system.Memory.OdataId
@@ -329,6 +333,16 @@ func (client *Client) findAllEndpoints() bool {
 			}
 			if client.redfish.Exists(DellLicensePath) {
 				client.path.Extra = append(client.path.Extra, DellLicensePath)
+			}
+			// EnvironmentMetrics is optional and absent on older firmware, so
+			// the path is recorded without probing it. Collection uses
+			// GetOptional, which treats a 404 as a quiet "not available".
+			if client.path.Chassis != "" {
+				if chassis.EnvironmentMetrics.OdataId != "" {
+					client.path.EnvironmentMetrics = chassis.EnvironmentMetrics.OdataId
+				} else {
+					client.path.EnvironmentMetrics = client.path.Chassis + "/EnvironmentMetrics"
+				}
 			}
 		}
 	}
@@ -1193,6 +1207,18 @@ func (client *Client) RefreshDell(mc *Collector, ch chan<- prometheus.Metric) bo
 				mc.NewDellManagerLicenseInfo(ch, &v)
 			}
 		} else {
+			result = false
+		}
+	}
+
+	// EnvironmentMetrics is optional: older firmware does not expose it, so a
+	// 404 is treated as "not available" and does not count as a scrape error.
+	if client.path.EnvironmentMetrics != "" {
+		env := EnvironmentMetrics{}
+		ok, status := client.redfish.GetOptional(client.path.EnvironmentMetrics, &env)
+		if ok {
+			mc.NewDellAverageFanPWM(ch, &env)
+		} else if status != http.StatusNotFound {
 			result = false
 		}
 	}

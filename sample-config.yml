@@ -151,3 +151,6 @@ metrics:
       maxage: 7d         # CONFIG_METRICS_MANAGER_EVENTS_MAXAGE=7d
   extra:
     enabled: false       # CONFIG_METRICS_EXTRA_ENABLED=false
+    # On Dell systems this group also exports idrac_dell_average_fan_pwm from
+    # the chassis EnvironmentMetrics resource. The resource is optional and is
+    # skipped quietly when the firmware does not expose it.

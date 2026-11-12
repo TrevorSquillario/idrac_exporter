@@ -249,7 +249,10 @@ These metrics do not belong anywhere else and they might be OEM specific. At the
 idrac_dell_manager_license_info{id,description,device,status,type}
 idrac_dell_battery_rollup_health{status}
 idrac_dell_estimated_system_airflow_cfm
+idrac_dell_average_fan_pwm
 ```
+
+The `idrac_dell_average_fan_pwm` metric is read from the Dell OEM extension of the chassis `EnvironmentMetrics` resource. It is only available on iDRAC firmware that exposes this resource; on other systems, or when the resource is absent, the metric is simply not exported and no scrape error is recorded.
 
 ### Exporter
 These metrics contain information about the exporter itself, such as build information and how many errors that have been encountered when scraping the Redfish API.

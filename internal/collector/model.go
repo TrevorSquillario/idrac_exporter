@@ -202,16 +202,17 @@ type ChassisResponse struct {
 			Room     string `json:"Room"`
 		} `json:"PostalAddress"`
 	} `json:"Location"`
-	Memory           Odata  `json:"Memory"`
-	NetworkAdapters  Odata  `json:"NetworkAdapters"`
-	PCIeSlots        Odata  `json:"PCIeSlots"`
-	Power            Odata  `json:"Power"`
-	PowerSubsystem   Odata  `json:"PowerSubsystem"`
-	Sensors          Odata  `json:"Sensors"`
-	Status           Status `json:"Status"`
-	Thermal          Odata  `json:"Thermal"`
-	ThermalSubsystem Odata  `json:"ThermalSubsystem"`
-	PhysicalSecurity *struct {
+	EnvironmentMetrics Odata  `json:"EnvironmentMetrics"`
+	Memory             Odata  `json:"Memory"`
+	NetworkAdapters    Odata  `json:"NetworkAdapters"`
+	PCIeSlots          Odata  `json:"PCIeSlots"`
+	Power              Odata  `json:"Power"`
+	PowerSubsystem     Odata  `json:"PowerSubsystem"`
+	Sensors            Odata  `json:"Sensors"`
+	Status             Status `json:"Status"`
+	Thermal            Odata  `json:"Thermal"`
+	ThermalSubsystem   Odata  `json:"ThermalSubsystem"`
+	PhysicalSecurity   *struct {
 		IntrusionSensor       string `json:"IntrusionSensor"`
 		IntrusionSensorNumber int    `json:"IntrusionSensorNumber"`
 		IntrusionSensorReArm  string `json:"IntrusionSensorReArm"`
@@ -929,6 +930,24 @@ type DellSystem struct {
 	SystemHealthRollupStatus           string  `json:"SystemHealthRollupStatus"`
 	TempRollupStatus                   string  `json:"TempRollupStatus"`
 	TempStatisticsRollupStatus         string  `json:"TempStatisticsRollupStatus"`
+}
+
+// EnvironmentMetrics represents the chassis environment metrics resource. The
+// standard properties are not used yet; only the Dell OEM extension is
+// consumed. The resource is optional and is absent on many BMCs.
+type EnvironmentMetrics struct {
+	Odata
+	Oem struct {
+		Dell *DellEnvironmentMetrics `json:"Dell"`
+	} `json:"Oem"`
+}
+
+// DellEnvironmentMetrics is the Dell OEM extension of EnvironmentMetrics.
+// AverageFanPWM is decoded as "any" because some firmware revisions report it
+// as a JSON string, and because a missing property must be distinguishable
+// from a legitimate reading of zero.
+type DellEnvironmentMetrics struct {
+	AverageFanPWM any `json:"AverageFanPWM"`
 }
 
 type DellAttributes struct {

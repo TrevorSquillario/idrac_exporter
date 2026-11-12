@@ -904,6 +904,25 @@ func (mc *Collector) NewDellEstimatedSystemAirflowCFM(ch chan<- prometheus.Metri
 	)
 }
 
+// NewDellAverageFanPWM emits the Dell OEM AverageFanPWM reading from the
+// chassis EnvironmentMetrics resource. The metric is skipped when the OEM
+// extension is absent (non-Dell systems) or when the property is missing or
+// cannot be coerced to a number. A reading of zero is valid and is emitted.
+func (mc *Collector) NewDellAverageFanPWM(ch chan<- prometheus.Metric, m *EnvironmentMetrics) {
+	if m.Oem.Dell == nil {
+		return
+	}
+	value, ok := asFloat64(m.Oem.Dell.AverageFanPWM)
+	if !ok {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(
+		mc.DellAverageFanPWM,
+		prometheus.GaugeValue,
+		value,
+	)
+}
+
 func (mc *Collector) NewDellControllerBatteryHealth(ch chan<- prometheus.Metric, m *Storage) {
 	if m.Oem.Dell == nil {
 		return

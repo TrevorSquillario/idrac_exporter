@@ -124,6 +124,7 @@ type Collector struct {
 	// Dell OEM
 	DellBatteryRollupHealth       *prometheus.Desc
 	DellEstimatedSystemAirflowCFM *prometheus.Desc
+	DellAverageFanPWM             *prometheus.Desc
 	DellControllerBatteryHealth   *prometheus.Desc
 	DellManagerLicenseInfo        *prometheus.Desc
 
@@ -504,6 +505,11 @@ func NewCollector() *Collector {
 			"Estimated system airflow in cubic feet per minute",
 			nil, nil,
 		),
+		DellAverageFanPWM: prometheus.NewDesc(
+			prometheus.BuildFQName(prefix, "dell", "average_fan_pwm"),
+			"Average fan PWM (pulse-width modulation) percentage reported by the chassis environment metrics",
+			nil, nil,
+		),
 		DellControllerBatteryHealth: prometheus.NewDesc(
 			prometheus.BuildFQName(prefix, "dell", "controller_battery_health"),
 			"Health status of storage controller battery",
@@ -627,6 +633,7 @@ func (collector *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- collector.ManagerRemoteConsoleMaxSessions
 	ch <- collector.DellBatteryRollupHealth
 	ch <- collector.DellEstimatedSystemAirflowCFM
+	ch <- collector.DellAverageFanPWM
 	ch <- collector.DellControllerBatteryHealth
 	ch <- collector.DellManagerLicenseInfo
 	ch <- collector.PduInfo
