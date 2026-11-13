@@ -3,6 +3,7 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/mrlhansen/idrac_exporter/internal/config"
@@ -17,7 +18,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 		expectedValue float64
 		expectedCtx   string
 		expectedFqdd  string
-		expectedLabel string
+		expectedType  MetricType
+		expectedName  string
 	}{
 		{
 			name:          "AverageConsumedWatts_string",
@@ -25,7 +27,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 			expectedValue: 507,
 			expectedCtx:   "",
 			expectedFqdd:  "",
-			expectedLabel: "",
+			expectedType:  MetricTypeGauge,
+			expectedName:  "idrac_telemetry_average_consumed_watts",
 		},
 		{
 			name:          "AverageConsumedWatts_number",
@@ -33,7 +36,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 			expectedValue: 507,
 			expectedCtx:   "",
 			expectedFqdd:  "",
-			expectedLabel: "",
+			expectedType:  MetricTypeGauge,
+			expectedName:  "idrac_telemetry_average_consumed_watts",
 		},
 		{
 			name:          "TemperatureReading",
@@ -41,7 +45,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 			expectedValue: 50,
 			expectedCtx:   "Embedded NIC 1 Port 1 Partition 1",
 			expectedFqdd:  "NIC.Embedded.1-1-1",
-			expectedLabel: "Embedded NIC 1 Port 1 Partition 1 TemperatureReading",
+			expectedType:  MetricTypeGauge,
+			expectedName:  "idrac_telemetry_temperature_reading",
 		},
 		{
 			name:          "AddressParityError_bool_string",
@@ -49,7 +54,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 			expectedValue: 0,
 			expectedCtx:   "DIMM A1",
 			expectedFqdd:  "DIMM.Socket.A1",
-			expectedLabel: "DIMM A1 AddressParityError",
+			expectedType:  MetricTypeCounter,
+			expectedName:  "idrac_telemetry_address_parity_error_total",
 		},
 		{
 			name:          "ReadErrorRate",
@@ -57,7 +63,8 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 			expectedValue: 0,
 			expectedCtx:   "SMARTData:Disk.Bay.0:Enclosure.Internal.0-1:RAID.SL.1-1",
 			expectedFqdd:  "SMARTData:Disk.Bay.0:Enclosure.Internal.0-1:RAID.SL.1-1",
-			expectedLabel: "SMARTData:Disk.Bay.0:Enclosure.Internal.0-1:RAID.SL.1-1 ReadErrorRate",
+			expectedType:  MetricTypeGauge,
+			expectedName:  "idrac_telemetry_read_error_rate",
 		},
 	}
 
@@ -82,14 +89,14 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				config.SetConfig(config.NewConfig())
 			}
 			old := config.Config.MetricsPrefix
-			config.Config.MetricsPrefix = ""
+			config.Config.MetricsPrefix = "idrac"
 			defer func() { config.Config.MetricsPrefix = old }()
 
 			ch := make(chan prometheus.Metric, 1)
 			var mc Collector
 
-			// build pointers for context/fqdd/label if present
-			var ctxPtr, fqPtr, labPtr *string
+			// build pointers for context/fqdd if present
+			var ctxPtr, fqPtr *string
 			if mv.Oem != nil && mv.Oem.Dell != nil {
 				if mv.Oem.Dell.ContextID != "" {
 					ctxPtr = &mv.Oem.Dell.ContextID
@@ -100,12 +107,9 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				if mv.Oem.Dell.FQDD != "" {
 					fqPtr = &mv.Oem.Dell.FQDD
 				}
-				if mv.Oem.Dell.Label != "" {
-					labPtr = &mv.Oem.Dell.Label
-				}
 			}
 
-			mc.NewMetricReportEntry(ch, resp.Id, mv.MetricId, ctxPtr, fqPtr, labPtr, v)
+			mc.NewMetricReportEntry(ch, resp.Id, mv.MetricId, ctxPtr, fqPtr, v)
 
 			select {
 			case m := <-ch:
@@ -113,15 +117,34 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				if err := m.Write(dtoMetric); err != nil {
 					t.Fatalf("metric write: %v", err)
 				}
-				if dtoMetric.GetGauge() == nil {
-					t.Fatalf("expected gauge metric")
+
+				// The emitted value type must match the classification.
+				switch c.expectedType {
+				case MetricTypeCounter:
+					if dtoMetric.GetCounter() == nil {
+						t.Fatalf("expected counter metric, got %s", dtoMetric)
+					}
+					if dtoMetric.GetCounter().GetValue() != c.expectedValue {
+						t.Fatalf("expected value %v, got %v", c.expectedValue, dtoMetric.GetCounter().GetValue())
+					}
+				default:
+					if dtoMetric.GetGauge() == nil {
+						t.Fatalf("expected gauge metric, got %s", dtoMetric)
+					}
+					if dtoMetric.GetGauge().GetValue() != c.expectedValue {
+						t.Fatalf("expected value %v, got %v", c.expectedValue, dtoMetric.GetGauge().GetValue())
+					}
 				}
-				if dtoMetric.GetGauge().GetValue() != c.expectedValue {
-					t.Fatalf("expected value %v, got %v", c.expectedValue, dtoMetric.GetGauge().GetValue())
+
+				// The metric family name must reflect the classification
+				// (counters carry a "_total" suffix).
+				if desc := m.Desc().String(); !strings.Contains(desc, `fqName: "`+c.expectedName+`"`) {
+					t.Fatalf("expected metric name %q, got %s", c.expectedName, desc)
 				}
+
 				labels := dtoMetric.GetLabel()
-				if len(labels) != 4 {
-					t.Fatalf("expected 4 labels, got %d", len(labels))
+				if len(labels) != 3 {
+					t.Fatalf("expected 3 labels, got %d", len(labels))
 				}
 				labmap := make(map[string]string, len(labels))
 				for _, lp := range labels {
@@ -135,9 +158,6 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				}
 				if labmap["fqdd"] != c.expectedFqdd {
 					t.Fatalf("fqdd label mismatch: expected %q got %q", c.expectedFqdd, labmap["fqdd"])
-				}
-				if labmap["label"] != c.expectedLabel {
-					t.Fatalf("label label mismatch: expected %q got %q", c.expectedLabel, labmap["label"])
 				}
 			default:
 				t.Fatalf("no metric emitted for case %s", c.name)
@@ -211,5 +231,119 @@ func TestMetricHelpKind(t *testing.T) {
 	}
 	if got := metricHelpKind("RPMReading"); got != "Sensor" {
 		t.Fatalf("expected Sensor, got %s", got)
+	}
+}
+
+// TestMetricReportHelpDeterministic verifies that MetricIds which sanitize to
+// the same family name also produce the same help string. A mismatch would
+// make registry.Gather() fail with an inconsistent-help error.
+func TestMetricReportHelpDeterministic(t *testing.T) {
+	if config.Config == nil {
+		config.SetConfig(config.NewConfig())
+	}
+	old := config.Config.MetricsPrefix
+	config.Config.MetricsPrefix = "idrac"
+	defer func() { config.Config.MetricsPrefix = old }()
+
+	variants := []string{"TemperatureReading", "temperature_reading", "TEMPERATURE_READING"}
+
+	var firstDesc string
+	for _, id := range variants {
+		ch := make(chan prometheus.Metric, 1)
+		var mc Collector
+		mc.NewMetricReportEntry(ch, "MetricReport", id, nil, nil, 42)
+
+		m := <-ch
+		desc := m.Desc().String()
+		if firstDesc == "" {
+			firstDesc = desc
+			continue
+		}
+		if desc != firstDesc {
+			t.Fatalf("help/desc mismatch for %q:\nfirst: %s\ngot:   %s", id, firstDesc, desc)
+		}
+	}
+}
+
+func TestClassifyMetric(t *testing.T) {
+	cases := []struct {
+		in       string
+		expected MetricType
+	}{
+		// Timestamps are checked before everything else.
+		{"energy_timestamp", MetricTypeTimestamp},
+		{"last_day_max_power_time", MetricTypeTimestamp},
+		{"last_reset_time_seconds", MetricTypeTimestamp},
+		{"power_timestamp_seconds", MetricTypeTimestamp},
+
+		// Counters: whole-token matches.
+		{"error_count", MetricTypeCounter},
+		{"crc_error_count", MetricTypeCounter},
+		{"current_pending_sector_count", MetricTypeCounter},
+		{"power_cycle_count", MetricTypeCounter},
+		{"media_write_count", MetricTypeCounter},
+		{"program_fail_count", MetricTypeCounter},
+		{"reallocated_block_count", MetricTypeCounter},
+		{"rx_bytes", MetricTypeCounter},
+		{"tx_bytes", MetricTypeCounter},
+		{"rx_broadcast", MetricTypeCounter},
+		{"tx_unicast", MetricTypeCounter},
+		{"lan_unicast_pkt_rx_count", MetricTypeCounter},
+		{"lan_unicast_pkt_tx_count", MetricTypeCounter},
+		{"cpu_pkg_energy", MetricTypeCounter},
+		{"dram_pkg_energy", MetricTypeCounter},
+		{"address_parity_error", MetricTypeCounter},
+		{"correctable_ecc_error", MetricTypeCounter},
+		{"limiting_events", MetricTypeCounter},
+		{"acc_core_cycles", MetricTypeCounter},
+		{"acc_core_cycles_total", MetricTypeCounter},
+
+		// Previously missed bare forms, now covered by token matching.
+		{"energy_consumption", MetricTypeCounter},
+		{"bytes_read", MetricTypeCounter},
+		{"packets_received", MetricTypeCounter},
+		{"energyk_wh", MetricTypeCounter},
+
+		// Trailing gauge qualifiers win over counter-looking tokens.
+		{"bytes_free", MetricTypeGauge},
+		{"bytes_per_second", MetricTypeGauge},
+		{"memory_available", MetricTypeGauge},
+		{"energy_percent", MetricTypeGauge},
+		{"read_error_rate", MetricTypeGauge},
+		{"power_consumed_watts", MetricTypeGauge},
+
+		// Gauges (fallback).
+		{"temperature_reading", MetricTypeGauge},
+		{"fan_rpm", MetricTypeGauge},
+		{"average_consumed_watts", MetricTypeGauge},
+		{"percent", MetricTypeGauge},
+		{"", MetricTypeGauge},
+	}
+
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			if got := ClassifyMetric(c.in); got != c.expected {
+				t.Fatalf("expected %q for %q, got %q", c.expected, c.in, got)
+			}
+		})
+	}
+}
+
+func TestMetricTypeValueType(t *testing.T) {
+	cases := []struct {
+		in       MetricType
+		expected prometheus.ValueType
+	}{
+		{MetricTypeCounter, prometheus.CounterValue},
+		{MetricTypeGauge, prometheus.GaugeValue},
+		{MetricTypeTimestamp, prometheus.GaugeValue},
+	}
+
+	for _, c := range cases {
+		t.Run(string(c.in), func(t *testing.T) {
+			if got := c.in.ValueType(); got != c.expected {
+				t.Fatalf("expected %v for %q, got %v", c.expected, c.in, got)
+			}
+		})
 	}
 }

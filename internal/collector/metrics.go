@@ -1070,7 +1070,7 @@ func (mc *Collector) NewPduEnergyKWh(ch chan<- prometheus.Metric, id string, m *
 	)
 }
 
-func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricReportId, metricId string, contextId, fqdd, label *string, value float64) {
+func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricReportId, metricId string, contextId, fqdd *string, value float64) {
 	// Convert nil pointers to empty strings for label values.
 	ctx := ""
 	if contextId != nil {
@@ -1080,43 +1080,57 @@ func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricRep
 	if fqdd != nil {
 		fq = *fqdd
 	}
-	lab := ""
-	if label != nil {
-		lab = *label
-	}
-	// source removed — not emitted as a label
+	// source and label removed — not emitted as labels. The Dell OEM Label is
+	// always "<ContextID> <MetricId>", so it is fully derivable from the
+	// context label and the metric family name.
 
 	mid := sanitizeMetricName(metricId)
 
+	// Classify the metric so it is exposed with the correct Prometheus value
+	// type. Counters additionally follow the Prometheus naming convention and
+	// get a "_total" suffix, unless the name already carries a counter-style
+	// suffix ("_total" or "_count").
+	metricType := ClassifyMetric(mid)
+	if metricType == MetricTypeCounter &&
+		!strings.HasSuffix(mid, "_total") &&
+		!strings.HasSuffix(mid, "_count") {
+		mid += "_total"
+	}
+
 	// Build metric family name as: <prefix>_telemetry_<metricId>
 	parts := []string{}
-	if p := sanitizeMetricName(config.Config.MetricsPrefix); p != "" {
-		parts = append(parts, p)
-		parts = append(parts, "telemetry")
+	// Check the configured prefix before sanitizing: sanitizeMetricName("")
+	// returns "metric", which would otherwise leak into the family name.
+	if config.Config.MetricsPrefix != "" {
+		if p := sanitizeMetricName(config.Config.MetricsPrefix); p != "" {
+			parts = append(parts, p)
+			parts = append(parts, "telemetry")
+		}
 	}
 	if mid != "" {
 		parts = append(parts, mid)
 	}
 	fqName := strings.Join(parts, "_")
 
-	// Determine help kind based on metricId so help strings are meaningful
-	// (e.g. temperature metrics are "ThermalSensor", rpm/speed use "Sensor").
-	helpKind := metricHelpKind(metricId)
+	// Determine help kind from the sanitized name so that MetricIds which
+	// differ only in case or punctuation (and therefore collapse into the same
+	// metric family) produce an identical help string. A mismatch would make
+	// registry.Gather() fail.
+	helpKind := metricHelpKind(mid)
 	desc := prometheus.NewDesc(
 		fqName,
-		fmt.Sprintf("Metric report %s %s", helpKind, metricId),
-		[]string{"metric_report_id", "context", "fqdd", "label"},
+		fmt.Sprintf("Metric report %s %s", helpKind, mid),
+		[]string{"metric_report_id", "context", "fqdd"},
 		nil,
 	)
 
 	ch <- prometheus.MustNewConstMetric(
 		desc,
-		prometheus.GaugeValue,
+		metricType.ValueType(),
 		value,
 		metricReportId,
 		ctx,
 		fq,
-		lab,
 	)
 }
 
@@ -1177,13 +1191,10 @@ func camelToSnake(s string) string {
 }
 
 // metricHelpKind maps a metricId to a short kind used in help strings.
+// "temp" also covers "temperature", so a single check is sufficient.
 func metricHelpKind(metricId string) string {
-	m := strings.ToLower(metricId)
-	if strings.Contains(m, "temp") || strings.Contains(m, "temperature") {
+	if strings.Contains(strings.ToLower(metricId), "temp") {
 		return "ThermalSensor"
-	}
-	if strings.Contains(m, "rpm") || strings.Contains(m, "speed") || strings.Contains(m, "rate") {
-		return "Sensor"
 	}
 	return "Sensor"
 }

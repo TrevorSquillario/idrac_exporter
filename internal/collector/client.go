@@ -1433,7 +1433,6 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		value    float64
 		ctx      *string
 		fqdd     *string
-		label    *string
 		source   *string
 	}
 	latest := map[string]metricVal{}
@@ -1462,7 +1461,6 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		// MetricProperty if present. If neither exists the context is nil.
 		var ctxPtr *string
 		var fqddPtr *string
-		var labelPtr *string
 		var sourcePtr *string
 		if mv.Oem != nil && mv.Oem.Dell != nil {
 			if mv.Oem.Dell.ContextID != "" {
@@ -1472,10 +1470,6 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 			if mv.Oem.Dell.FQDD != "" {
 				s := mv.Oem.Dell.FQDD
 				fqddPtr = &s
-			}
-			if mv.Oem.Dell.Label != "" {
-				s := mv.Oem.Dell.Label
-				labelPtr = &s
 			}
 			if mv.Oem.Dell.Source != "" {
 				s := mv.Oem.Dell.Source
@@ -1489,11 +1483,11 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		}
 
 		key := buildMetricEntryKey(mv.MetricId, ctxPtr, fqddPtr)
-		latest[key] = metricVal{metricId: mv.MetricId, value: value, ctx: ctxPtr, fqdd: fqddPtr, label: labelPtr, source: sourcePtr}
+		latest[key] = metricVal{metricId: mv.MetricId, value: value, ctx: ctxPtr, fqdd: fqddPtr, source: sourcePtr}
 	}
 
 	for _, mv := range latest {
-		mc.NewMetricReportEntry(ch, resp.Id, mv.metricId, mv.ctx, mv.fqdd, mv.label, mv.value)
+		mc.NewMetricReportEntry(ch, resp.Id, mv.metricId, mv.ctx, mv.fqdd, mv.value)
 	}
 
 	return true

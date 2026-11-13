@@ -271,6 +271,19 @@ idrac_pdu_power_watts{id}
 idrac_pdu_energy_kwh{id}
 ```
 
+### Telemetry
+When one or more `telemetry_reports` are configured, the exporter emits one metric per entry in each Redfish TelemetryService MetricReport. The metric family name is derived from the MetricId, so the exact set of metrics depends on the reports enabled on the BMC.
+
+```text
+idrac_telemetry_<metric_id>{metric_report_id,context,fqdd}
+```
+
+- `metric_report_id` identifies the MetricReport the value came from. The same MetricId can appear in several reports, so this label is required to keep series unique.
+- `context` is the human-readable location from the Dell OEM `ContextID` field (e.g. `CPU.Socket.1`, `DIMM A1`). It falls back to the standard `MetricProperty` URI when OEM data is absent.
+- `fqdd` is the stable Redfish Fully Qualified Device Descriptor (e.g. `CPU.Socket.1`, `DIMM.Socket.A1`, `NIC.Embedded.1-1-1`). It is empty when the BMC does not provide one.
+
+MetricIds that look like monotonically increasing counters (e.g. `CRCErrorCount`) are exposed as counters and get a `_total` suffix; everything else is a gauge.
+
 
 ## Endpoints
 The exporter has several different endpoints.
