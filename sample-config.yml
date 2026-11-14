@@ -156,6 +156,9 @@ metrics:
 # Typically individual telemetry reports have to be enabled first before they can be collected.
 # The names of the telemetry reports can be found at:
 # /redfish/v1/TelemetryService/MetricReportDefinitions
+#
+# Duplicate entries are collapsed during configuration validation and a warning
+# is logged for each duplicate.
 
 telemetry_reports:
   - StorageDiskSMARTData

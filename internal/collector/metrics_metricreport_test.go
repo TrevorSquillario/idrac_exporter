@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrlhansen/idrac_exporter/internal/config"
 	"github.com/prometheus/client_golang/prometheus"
@@ -109,7 +110,9 @@ func TestNewMetricReportEntry_FromSamples(t *testing.T) {
 				}
 			}
 
-			mc.NewMetricReportEntry(ch, resp.Id, mv.MetricId, ctxPtr, fqPtr, v)
+			if err := mc.NewMetricReportEntry(ch, resp.Id, mv.MetricId, ctxPtr, fqPtr, v); err != nil {
+				t.Fatalf("emit error: %v", err)
+			}
 
 			select {
 			case m := <-ch:
@@ -183,8 +186,8 @@ func TestParseMetricValue_StateStrings(t *testing.T) {
 		{"Non operational", 0},
 		{"OK", 0},
 		{"Degraded", 1},
-		{"Critical", 3},
-		{"Unknown", 4},
+		{"Critical", 2},
+		{"Unknown", 10},
 		{"true", 1},
 		{"false", 0},
 		{"507", 507},
@@ -251,7 +254,9 @@ func TestMetricReportHelpDeterministic(t *testing.T) {
 	for _, id := range variants {
 		ch := make(chan prometheus.Metric, 1)
 		var mc Collector
-		mc.NewMetricReportEntry(ch, "MetricReport", id, nil, nil, 42)
+		if err := mc.NewMetricReportEntry(ch, "MetricReport", id, nil, nil, 42); err != nil {
+			t.Fatalf("emit error for %q: %v", id, err)
+		}
 
 		m := <-ch
 		desc := m.Desc().String()
@@ -345,5 +350,240 @@ func TestMetricTypeValueType(t *testing.T) {
 				t.Fatalf("expected %v for %q, got %v", c.expected, c.in, got)
 			}
 		})
+	}
+}
+
+func TestHealthValue(t *testing.T) {
+	cases := []struct {
+		in       string
+		expected int
+		ok       bool
+	}{
+		{"", -1, false},
+		{"OK", 0, true},
+		{"ok", 0, true},
+		{"GoodInUse", 0, true},
+		{"Warning", 1, true},
+		{"Degraded", 1, true},
+		{"Critical", 2, true},
+		{"Unknown", 10, true},
+		{"Bogus", 10, false},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, ok := healthValue(c.in)
+			if got != c.expected || ok != c.ok {
+				t.Fatalf("expected (%d,%v) for %q, got (%d,%v)", c.expected, c.ok, c.in, got, ok)
+			}
+		})
+	}
+}
+
+// TestMetricReportSeriesKeyDistinguishesParts verifies that the series key
+// cannot be forged by embedding the separator inside a label value.
+func TestMetricReportSeriesKeyDistinguishesParts(t *testing.T) {
+	a := "a"
+	b := "b"
+	ab := "a|b"
+	empty := ""
+
+	// ("a", "b") must not collide with ("a|b", "").
+	k1 := metricReportSeriesKey("report", "Metric", &a, &b)
+	k2 := metricReportSeriesKey("report", "Metric", &ab, &empty)
+	if k1 == k2 {
+		t.Fatalf("series keys collided: %q", k1)
+	}
+
+	// nil and empty must normalize to the same identity.
+	k3 := metricReportSeriesKey("report", "Metric", nil, nil)
+	k4 := metricReportSeriesKey("report", "Metric", &empty, &empty)
+	if k3 != k4 {
+		t.Fatalf("nil and empty context should share identity: %q vs %q", k3, k4)
+	}
+
+	// The report ID must participate in the identity.
+	k5 := metricReportSeriesKey("other", "Metric", nil, nil)
+	if k3 == k5 {
+		t.Fatal("metric_report_id must be part of the series identity")
+	}
+}
+
+func TestPreferMetricReportEntry(t *testing.T) {
+	older := metricReportEntry{ts: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), hasTS: true}
+	newer := metricReportEntry{ts: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), hasTS: true}
+	noTS := metricReportEntry{}
+
+	cases := []struct {
+		name      string
+		existing  metricReportEntry
+		candidate metricReportEntry
+		expected  bool
+	}{
+		{"newer beats older", older, newer, true},
+		{"older loses to newer", newer, older, false},
+		{"tie keeps first", older, older, false},
+		{"valid beats invalid", noTS, older, true},
+		{"invalid loses to valid", older, noTS, false},
+		{"invalid vs invalid keeps first", noTS, noTS, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := preferMetricReportEntry(c.existing, c.candidate); got != c.expected {
+				t.Fatalf("expected %v, got %v", c.expected, got)
+			}
+		})
+	}
+}
+
+func TestParseMetricTimestamp(t *testing.T) {
+	if _, ok := parseMetricTimestamp(""); ok {
+		t.Fatal("empty timestamp should be invalid")
+	}
+	if _, ok := parseMetricTimestamp("not-a-timestamp"); ok {
+		t.Fatal("garbage timestamp should be invalid")
+	}
+	ts, ok := parseMetricTimestamp("2026-04-01T01:45:35.000Z")
+	if !ok {
+		t.Fatal("expected valid timestamp")
+	}
+	if ts.IsZero() {
+		t.Fatal("expected non-zero timestamp")
+	}
+}
+
+// TestParseMetricValue_AnchoredStatusMatching verifies that status matching is
+// anchored to the leading word, so unrelated values are not misclassified.
+func TestParseMetricValue_AnchoredStatusMatching(t *testing.T) {
+	// These previously matched via substring/prefix checks and were silently
+	// mapped to 1 ("set"/"on") or 0 ("ok"/"off").
+	for _, in := range []string{"offset", "reset", "unset", "broken", "onset"} {
+		t.Run(in, func(t *testing.T) {
+			if _, err := parseMetricValue(MetricReportValue{MetricValue: in}); err == nil {
+				t.Fatalf("expected error for %q, got a numeric mapping", in)
+			}
+		})
+	}
+
+	// Suffixed forms must still resolve via their leading word.
+	cases := []struct {
+		in       string
+		expected float64
+	}{
+		{"OK (some info)", 0},
+		{"Degraded: reason", 1},
+		{"Critical - fan failure", 2},
+		{"Unknown; no data", 10},
+		{"Online", 1},
+		{"Offline", 0},
+		{"Enabled", 1},
+		{"Disabled", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.in, func(t *testing.T) {
+			got, err := parseMetricValue(MetricReportValue{MetricValue: c.in})
+			if err != nil {
+				t.Fatalf("parse error for %q: %v", c.in, err)
+			}
+			if got != c.expected {
+				t.Fatalf("expected %v for %q, got %v", c.expected, c.in, got)
+			}
+		})
+	}
+}
+
+// telemetryTestCollector emits telemetry metrics through the same claim guard
+// used by RefreshMetricReport, so tests can exercise real registry gathering.
+type telemetryTestCollector struct {
+	mc      *Collector
+	entries []struct {
+		reportID string
+		metricId string
+		ctx      *string
+		fqdd     *string
+		value    float64
+	}
+}
+
+func (c *telemetryTestCollector) Describe(ch chan<- *prometheus.Desc) {}
+
+func (c *telemetryTestCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, e := range c.entries {
+		key := metricReportSeriesKey(e.reportID, e.metricId, e.ctx, e.fqdd)
+		if !c.mc.claimMetricReportSeries(key) {
+			continue
+		}
+		if err := c.mc.NewMetricReportEntry(ch, e.reportID, e.metricId, e.ctx, e.fqdd, e.value); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// TestDuplicateEmittedIdentityGathers verifies that two entries resolving to
+// the same emitted series do not make registry.Gather() fail.
+func TestDuplicateEmittedIdentityGathers(t *testing.T) {
+	if config.Config == nil {
+		config.SetConfig(config.NewConfig())
+	}
+	old := config.Config.MetricsPrefix
+	config.Config.MetricsPrefix = "idrac"
+	defer func() { config.Config.MetricsPrefix = old }()
+
+	ctx := "CPU.Socket.1"
+	fqdd := "CPU.Socket.1"
+
+	mc := &Collector{emitted: make(map[string]struct{})}
+	tc := &telemetryTestCollector{mc: mc}
+	tc.entries = append(tc.entries,
+		struct {
+			reportID string
+			metricId string
+			ctx      *string
+			fqdd     *string
+			value    float64
+		}{"ThermalSensor", "TemperatureReading", &ctx, &fqdd, 50},
+		struct {
+			reportID string
+			metricId string
+			ctx      *string
+			fqdd     *string
+			value    float64
+		}{"ThermalSensor", "temperature_reading", &ctx, &fqdd, 51},
+	)
+
+	reg := prometheus.NewRegistry()
+	if err := reg.Register(tc); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather must not fail on duplicate identity: %v", err)
+	}
+	if len(families) != 1 {
+		t.Fatalf("expected 1 metric family, got %d", len(families))
+	}
+	if n := len(families[0].GetMetric()); n != 1 {
+		t.Fatalf("expected 1 series, got %d", n)
+	}
+}
+
+// TestClaimMetricReportSeries verifies the guard semantics and that resetting
+// allows the same series to be claimed again on the next scrape.
+func TestClaimMetricReportSeries(t *testing.T) {
+	mc := &Collector{emitted: make(map[string]struct{})}
+
+	if !mc.claimMetricReportSeries("k") {
+		t.Fatal("first claim should succeed")
+	}
+	if mc.claimMetricReportSeries("k") {
+		t.Fatal("second claim of the same key should fail")
+	}
+	if !mc.claimMetricReportSeries("other") {
+		t.Fatal("claim of a different key should succeed")
+	}
+
+	mc.resetMetricReportSeries()
+	if !mc.claimMetricReportSeries("k") {
+		t.Fatal("claim after reset should succeed")
 	}
 }

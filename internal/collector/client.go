@@ -1241,25 +1241,65 @@ func (client *Client) RefreshPDUs(mc *Collector, ch chan<- prometheus.Metric) bo
 	return result
 }
 
-// buildMetricEntryKey returns an escaped composite key for deduplication
-// of MetricReport entries. The key combines metricId and context, separating
-// them with '|' and using "<nil>" to distinguish a nil context from an empty
-// string. The combined string is url.PathEscape'd to safely escape special
-// characters such as spaces, slashes, and colons.
-func buildMetricEntryKey(metricId string, parts ...*string) string {
-	// Build a composite dedupe key by joining metricId with the provided
-	// parts, using "<nil>" to distinguish nil from empty strings.
-	sb := strings.Builder{}
-	sb.WriteString(metricId)
-	for _, p := range parts {
+// metricReportSeriesKey returns the identity of an emitted telemetry series.
+// It combines the metric family name (which already encodes the sanitized
+// MetricId and the counter suffix), the metric_report_id label and the
+// normalized context/fqdd label values. Each part is length-prefixed so that
+// values containing the separator cannot collide.
+func metricReportSeriesKey(reportID, metricId string, ctx, fqdd *string) string {
+	ctxVal := ""
+	if ctx != nil {
+		ctxVal = *ctx
+	}
+	fqddVal := ""
+	if fqdd != nil {
+		fqddVal = *fqdd
+	}
+
+	var sb strings.Builder
+	for _, part := range []string{metricReportFamilyName(metricId), reportID, ctxVal, fqddVal} {
+		sb.WriteString(strconv.Itoa(len(part)))
+		sb.WriteByte(':')
+		sb.WriteString(part)
 		sb.WriteByte('|')
-		if p == nil {
-			sb.WriteString("<nil>")
-		} else {
-			sb.WriteString(*p)
-		}
 	}
 	return sb.String()
+}
+
+// metricReportEntry is a candidate telemetry value for a single series.
+type metricReportEntry struct {
+	metricId string
+	value    float64
+	ctx      *string
+	fqdd     *string
+	ts       time.Time
+	hasTS    bool
+}
+
+// preferMetricReportEntry reports whether candidate should replace existing.
+// A valid timestamp always beats an invalid one; among valid timestamps the
+// greatest wins; ties keep the first occurrence.
+func preferMetricReportEntry(existing, candidate metricReportEntry) bool {
+	if candidate.hasTS != existing.hasTS {
+		return candidate.hasTS
+	}
+	if !candidate.hasTS {
+		return false
+	}
+	return candidate.ts.After(existing.ts)
+}
+
+// parseMetricTimestamp parses a MetricReportValue Timestamp. RFC3339 and
+// RFC3339Nano forms are accepted; an empty or unparseable value reports false.
+func parseMetricTimestamp(s string) (time.Time, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 // errNoMetricValue is returned by parseMetricValue when a MetricReportValue
@@ -1273,14 +1313,18 @@ var errNoMetricValue = errors.New("no metric value")
 // normalized so boolean-like and status strings map to numeric codes, and
 // RFC3339 timestamps are converted to Unix seconds.
 //
+// Status strings are matched on their leading word only (see
+// normalizeStatusToken), so unrelated values such as "offset", "reset",
+// "unset" or "broken" are not misclassified as "set" or "ok".
+//
 // Priority (checked in this order):
-//  1. explicit keywords 'released'/'set' -> 0/1
-//  2. link/driver state keywords: Down=0, Up=1, Non-operational=0, Operational=1
-//  3. health/status keywords: OK=0, Degraded=1, Critical=3, Unknown=4
-//  4. true/false -> 1/0
-//  5. on/off prefixes -> 1/0
-//  6. numeric parse as float
-//  7. RFC3339 timestamp -> Unix seconds
+//  1. multi-word link state: "non-operational" -> 0
+//  2. leading-word keywords: released=0, set=1, down=0, up=1, operational=1,
+//     true=1, false=0, on/online/enabled=1, off/offline/disabled=0
+//  3. health/status keywords via healthValue: OK=0, Warning/Degraded=1,
+//     Critical=2, Unknown=10
+//  4. numeric parse as float
+//  5. RFC3339 timestamp -> Unix seconds
 //
 // An empty or nil value returns errNoMetricValue; any other unrepresentable
 // value returns a descriptive error.
@@ -1295,55 +1339,40 @@ func parseMetricValue(mv MetricReportValue) (float64, error) {
 			return 0, errNoMetricValue
 		}
 		sl := strings.ToLower(sv)
-		// Map explicit 'released'/'set' first (Dell LCLog etc.)
-		if strings.Contains(sl, "released") {
+
+		// Multi-word forms must be matched before tokenizing.
+		switch sl {
+		case "non-operational", "nonoperational", "non operational":
 			return 0, nil
 		}
-		if strings.Contains(sl, "set") {
-			return 1, nil
-		}
 
-		// Map link/driver state strings (e.g. NICStatistics LinkStatus and
-		// OSDriverState). These are matched exactly so that unrelated values
-		// containing the same words are not misclassified. "Non-operational"
-		// must be checked before "operational" since it contains it.
-		switch sl {
+		// Match the leading word only. "Non-operational" is handled above
+		// because it contains a hyphen rather than a delimiter.
+		switch normalizeStatusToken(sl) {
+		case "released":
+			return 0, nil
+		case "set":
+			return 1, nil
 		case "down":
 			return 0, nil
 		case "up":
 			return 1, nil
-		case "non-operational", "nonoperational", "non operational":
-			return 0, nil
 		case "operational":
 			return 1, nil
+		case "true":
+			return 1, nil
+		case "false":
+			return 0, nil
+		case "on", "online", "enabled":
+			return 1, nil
+		case "off", "offline", "disabled":
+			return 0, nil
 		}
 
-		// Map common health/status strings to numeric codes.
-		// Be permissive and match substrings to handle variations like
-		// "OK (some info)" or "Degraded: reason".
-		if strings.Contains(sl, "unknown") {
-			return 4, nil
-		}
-		if strings.Contains(sl, "ok") {
-			return 0, nil
-		}
-		if strings.Contains(sl, "degraded") {
-			return 1, nil
-		}
-		if strings.Contains(sl, "critical") {
-			return 3, nil
-		}
-		if sl == "true" {
-			return 1, nil
-		}
-		if sl == "false" {
-			return 0, nil
-		}
-		if strings.HasPrefix(sl, "on") {
-			return 1, nil
-		}
-		if strings.HasPrefix(sl, "off") {
-			return 0, nil
+		// Health/status strings use the canonical scale shared with
+		// health2value: 0=OK, 1=Warning, 2=Critical, 10=unknown.
+		if value, ok := healthValue(normalizeStatusToken(sl)); ok {
+			return float64(value), nil
 		}
 
 		if f, err := strconv.ParseFloat(sv, 64); err == nil {
@@ -1384,16 +1413,34 @@ func parseMetricValue(mv MetricReportValue) (float64, error) {
 	}
 }
 
+// normalizeStatusToken reduces a status string to its leading word so that
+// matching is anchored rather than substring-based. Everything from the first
+// delimiter (space, '(', ':', ',', ';', '|' or '-') onwards is discarded, so
+// "OK (some info)" -> "ok" and "Degraded: reason" -> "degraded", while
+// "offset", "reset", "unset" and "broken" remain whole words and therefore
+// no longer match "set" or "ok".
+func normalizeStatusToken(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if i := strings.IndexAny(s, " (:,;|-"); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
+}
+
 // RefreshMetricReport fetches a single Redfish TelemetryService MetricReport by
-// name and emits one Prometheus metric per unique (metricId, contextId) pair.
+// name and emits one Prometheus metric per unique emitted series.
 //
-// A MetricReport may contain multiple entries for the same metric captured at
-// different timestamps (e.g. a rolling buffer of readings). Iterating the slice
-// in order and overwriting the map entry on each pass means only the last —
-// i.e. the newest — value is retained before any metrics are emitted.
+// A MetricReport may contain multiple entries for the same series captured at
+// different timestamps (e.g. a rolling buffer of readings). Entries are
+// deduplicated on the full emitted identity (metric family name,
+// metric_report_id, context and fqdd). Among duplicates the entry with the
+// greatest valid timestamp wins; an entry with a valid timestamp always beats
+// one without, and ties keep the first occurrence.
 //
 // The contextId is taken from the Dell OEM ContextID field when present; it
-// falls back to the standard MetricProperty URI otherwise.
+// falls back to the standard MetricProperty URI otherwise. When the response
+// carries no Id, the configured report name is used as the metric_report_id
+// label so the series stays identifiable.
 //
 // A missing TelemetryService is not an error: telemetry is optional and may be
 // disabled on the BMC, so the report is skipped quietly. If the TelemetryService
@@ -1424,20 +1471,18 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		return false
 	}
 
-	// Deduplicate entries by a composite key (metricId + context), keeping
-	// the last value seen. We key the map by an escaped string produced by
-	// buildMetricEntryKey so special characters don't collide. metricVal
-	// stores the original metricId and ctx pointer for emission.
-	type metricVal struct {
-		metricId string
-		value    float64
-		ctx      *string
-		fqdd     *string
-		source   *string
+	// Fall back to the configured report name when the BMC omits the Id, so
+	// the metric_report_id label is never empty.
+	reportID := resp.Id
+	if reportID == "" {
+		reportID = name
+		log.Debug("MetricReport %s returned no Id, using configured name as metric_report_id", name)
 	}
-	latest := map[string]metricVal{}
 
-	report_id := resp.Id
+	// Deduplicate entries on the emitted series identity, keeping the entry
+	// with the greatest valid timestamp.
+	latest := map[string]metricReportEntry{}
+
 	for _, mv := range resp.MetricValues {
 		if mv.MetricId == "" {
 			continue
@@ -1449,9 +1494,9 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 			// level so they don't flood the log on every scrape, but they
 			// still count towards the scrape error counter.
 			if errors.Is(err, errNoMetricValue) {
-				log.Debug("skipping empty MetricValue for MetricId %s in report %s", mv.MetricId, report_id)
+				log.Debug("skipping empty MetricValue for MetricId %s in report %s", mv.MetricId, reportID)
 			} else {
-				log.Debug("skipping unparseable MetricValue %q for MetricId %s in report %s: %v", mv.MetricValue, mv.MetricId, report_id, err)
+				log.Debug("skipping unparseable MetricValue %q for MetricId %s in report %s: %v", mv.MetricValue, mv.MetricId, reportID, err)
 				mc.errors.Add(1)
 			}
 			continue
@@ -1461,7 +1506,6 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 		// MetricProperty if present. If neither exists the context is nil.
 		var ctxPtr *string
 		var fqddPtr *string
-		var sourcePtr *string
 		if mv.Oem != nil && mv.Oem.Dell != nil {
 			if mv.Oem.Dell.ContextID != "" {
 				s := mv.Oem.Dell.ContextID
@@ -1471,10 +1515,6 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 				s := mv.Oem.Dell.FQDD
 				fqddPtr = &s
 			}
-			if mv.Oem.Dell.Source != "" {
-				s := mv.Oem.Dell.Source
-				sourcePtr = &s
-			}
 		}
 		if ctxPtr == nil && mv.MetricProperty != nil {
 			// MetricProperty may be absent (nil) on some implementations (HPE
@@ -1482,12 +1522,37 @@ func (client *Client) RefreshMetricReport(name string, mc *Collector, ch chan<- 
 			ctxPtr = mv.MetricProperty
 		}
 
-		key := buildMetricEntryKey(mv.MetricId, ctxPtr, fqddPtr)
-		latest[key] = metricVal{metricId: mv.MetricId, value: value, ctx: ctxPtr, fqdd: fqddPtr, source: sourcePtr}
+		ts, hasTS := parseMetricTimestamp(mv.Timestamp)
+		candidate := metricReportEntry{
+			metricId: mv.MetricId,
+			value:    value,
+			ctx:      ctxPtr,
+			fqdd:     fqddPtr,
+			ts:       ts,
+			hasTS:    hasTS,
+		}
+
+		key := metricReportSeriesKey(reportID, mv.MetricId, ctxPtr, fqddPtr)
+		if existing, found := latest[key]; found && !preferMetricReportEntry(existing, candidate) {
+			continue
+		}
+		latest[key] = candidate
 	}
 
-	for _, mv := range latest {
-		mc.NewMetricReportEntry(ch, resp.Id, mv.metricId, mv.ctx, mv.fqdd, mv.value)
+	for key, mv := range latest {
+		// Reports are collected concurrently, so two reports can resolve to
+		// the same emitted series (e.g. when the BMC returns the same Id for
+		// different configured names). Claim the series before emitting so a
+		// duplicate cannot make registry.Gather() fail.
+		if !mc.claimMetricReportSeries(key) {
+			log.Warn("skipping duplicate telemetry series %s from MetricReport %s", metricReportFamilyName(mv.metricId), reportID)
+			continue
+		}
+
+		if err := mc.NewMetricReportEntry(ch, reportID, mv.metricId, mv.ctx, mv.fqdd, mv.value); err != nil {
+			log.Warn("failed to emit telemetry metric %s from MetricReport %s: %v", metricReportFamilyName(mv.metricId), reportID, err)
+			mc.errors.Add(1)
+		}
 	}
 
 	return true

@@ -92,6 +92,9 @@ The exporter can expose the metrics described in the sections below. For each me
 * 0 = OK
 * 1 = Warning
 * 2 = Critical
+* 10 = Unknown or unmapped
+
+The same scale is used for status strings found in telemetry reports (e.g. `OK`, `Degraded`, `Critical`, `Unknown`).
 
 ### System
 These metrics include power, health, and LED state, total memory size, number of physical processors, BIOS version and machine information.
@@ -278,11 +281,15 @@ When one or more `telemetry_reports` are configured, the exporter emits one metr
 idrac_telemetry_<metric_id>{metric_report_id,context,fqdd}
 ```
 
-- `metric_report_id` identifies the MetricReport the value came from. The same MetricId can appear in several reports, so this label is required to keep series unique.
+- `metric_report_id` identifies the MetricReport the value came from. The same MetricId can appear in several reports, so this label is required to keep series unique. When the BMC omits the report `Id`, the configured report name is used instead.
 - `context` is the human-readable location from the Dell OEM `ContextID` field (e.g. `CPU.Socket.1`, `DIMM A1`). It falls back to the standard `MetricProperty` URI when OEM data is absent.
 - `fqdd` is the stable Redfish Fully Qualified Device Descriptor (e.g. `CPU.Socket.1`, `DIMM.Socket.A1`, `NIC.Embedded.1-1-1`). It is empty when the BMC does not provide one.
 
 MetricIds that look like monotonically increasing counters (e.g. `CRCErrorCount`) are exposed as counters and get a `_total` suffix; everything else is a gauge.
+
+When a report contains several entries for the same series (e.g. a rolling buffer of readings), the entry with the greatest valid `Timestamp` is used. An entry with a valid timestamp always takes precedence over one without, and ties keep the first occurrence. Entries that resolve to an already-emitted series are skipped with a warning, so a scrape never fails because of duplicate series.
+
+Duplicate entries in `telemetry_reports` are collapsed during configuration validation, with a warning logged for each duplicate.
 
 
 ## Endpoints

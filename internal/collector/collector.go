@@ -27,6 +27,13 @@ type Collector struct {
 	errors     atomic.Uint64
 	builder    *strings.Builder
 
+	// emitted tracks telemetry series already claimed during the current
+	// scrape. Telemetry reports are collected concurrently, so two reports can
+	// resolve to the same emitted series; claiming prevents duplicate series
+	// from making registry.Gather() fail.
+	emittedMu sync.Mutex
+	emitted   map[string]struct{}
+
 	// Exporter
 	ExporterBuildInfo         *prometheus.Desc
 	ExporterScrapeErrorsTotal *prometheus.Desc
@@ -548,10 +555,37 @@ func NewCollector() *Collector {
 
 	collector.builder = new(strings.Builder)
 	collector.collected = sync.NewCond(new(sync.Mutex))
+	collector.emitted = make(map[string]struct{})
 	collector.registry = prometheus.NewRegistry()
 	collector.registry.Register(collector)
 
 	return collector
+}
+
+// claimMetricReportSeries reserves a telemetry series identity for the current
+// scrape. It returns false when the series was already emitted, in which case
+// the caller must skip emission to avoid a duplicate-series gather failure.
+func (collector *Collector) claimMetricReportSeries(key string) bool {
+	collector.emittedMu.Lock()
+	defer collector.emittedMu.Unlock()
+
+	if collector.emitted == nil {
+		collector.emitted = make(map[string]struct{})
+	}
+	if _, ok := collector.emitted[key]; ok {
+		return false
+	}
+	collector.emitted[key] = struct{}{}
+	return true
+}
+
+// resetMetricReportSeries clears the claimed telemetry series. It is called at
+// the start of every collection so each scrape starts from a clean slate.
+func (collector *Collector) resetMetricReportSeries() {
+	collector.emittedMu.Lock()
+	defer collector.emittedMu.Unlock()
+
+	clear(collector.emitted)
 }
 
 func (collector *Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -754,6 +788,9 @@ func (collector *Collector) CollectServer(ch chan<- prometheus.Metric) {
 
 func (collector *Collector) Collect(ch chan<- prometheus.Metric) {
 	collector.client.redfish.RefreshSession()
+
+	// Start every scrape with a clean telemetry series registry.
+	collector.resetMetricReportSeries()
 
 	if len(collector.client.path.RackPDUs) > 0 {
 		ok := collector.client.RefreshPDUs(collector, ch)

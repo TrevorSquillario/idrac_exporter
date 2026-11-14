@@ -66,6 +66,7 @@ func ReloadConfig(filename string, expand bool) {
 	// Whenever credentials or anything connection related is changed, all related targets are being reset
 
 	old.Metrics = cfg.Metrics
+	old.TelemetryReports = cfg.TelemetryReports
 	old.Mutex.Lock()
 	defer old.Mutex.Unlock()
 

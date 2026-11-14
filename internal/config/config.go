@@ -213,6 +213,27 @@ func (c *RootConfig) Validate() error {
 		c.MetricsPrefix = "idrac"
 	}
 
+	// telemetry_reports: trim entries, drop empties and collapse duplicates
+	// while preserving the first-occurrence order. Duplicate reports would
+	// otherwise be fetched twice and emit the same series twice.
+	if len(c.TelemetryReports) > 0 {
+		seen := make(map[string]struct{}, len(c.TelemetryReports))
+		reports := make([]string, 0, len(c.TelemetryReports))
+		for _, name := range c.TelemetryReports {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				log.Warn("Duplicate telemetry report %q ignored", name)
+				continue
+			}
+			seen[name] = struct{}{}
+			reports = append(reports, name)
+		}
+		c.TelemetryReports = reports
+	}
+
 	// events
 	err := c.Metrics.Events.validate()
 	if err != nil {

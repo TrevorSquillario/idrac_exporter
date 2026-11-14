@@ -30,18 +30,35 @@ func cleanUnits(s string) string {
 	return s
 }
 
-func health2value(health string) int {
-	switch health {
+// Canonical health/status scale shared by all *_health metrics and by
+// telemetry status strings:
+//
+//	 0 = OK
+//	 1 = Warning
+//	 2 = Critical
+//	10 = unknown/unmapped
+//
+// healthValue returns the numeric value and whether the input was recognized.
+// An empty string yields -1 (the internal "skip" sentinel) and false.
+func healthValue(status string) (int, bool) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "":
-		return -1
-	case "OK", "GoodInUse":
-		return 0
-	case "Warning":
-		return 1
-	case "Critical":
-		return 2
+		return -1, false
+	case "ok", "goodinuse":
+		return 0, true
+	case "warning", "degraded":
+		return 1, true
+	case "critical":
+		return 2, true
+	case "unknown":
+		return 10, true
 	}
-	return 10
+	return 10, false
+}
+
+func health2value(health string) int {
+	value, _ := healthValue(health)
+	return value
 }
 
 func linkstatus2value(status string) int {
@@ -1070,7 +1087,62 @@ func (mc *Collector) NewPduEnergyKWh(ch chan<- prometheus.Metric, id string, m *
 	)
 }
 
-func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricReportId, metricId string, contextId, fqdd *string, value float64) {
+// metricReportMetricName returns the sanitized metric name for a telemetry
+// MetricId, including the counter "_total" suffix required by the Prometheus
+// naming convention. Names that already carry a counter-style suffix
+// ("_total" or "_count") are left untouched.
+func metricReportMetricName(metricId string) string {
+	mid := sanitizeMetricName(metricId)
+	if ClassifyMetric(mid) == MetricTypeCounter &&
+		!strings.HasSuffix(mid, "_total") &&
+		!strings.HasSuffix(mid, "_count") {
+		mid += "_total"
+	}
+	return mid
+}
+
+// metricReportFamilyName returns the Prometheus metric family name for a
+// telemetry MetricId: <prefix>_telemetry_<sanitized metricId>. It is used both
+// when emitting the metric and when computing the series identity for
+// deduplication, so the two can never disagree.
+func metricReportFamilyName(metricId string) string {
+	parts := []string{}
+	// Check the configured prefix before sanitizing: sanitizeMetricName("")
+	// returns "metric", which would otherwise leak into the family name.
+	if config.Config != nil && config.Config.MetricsPrefix != "" {
+		if p := sanitizeMetricName(config.Config.MetricsPrefix); p != "" {
+			parts = append(parts, p, "telemetry")
+		}
+	}
+	if mid := metricReportMetricName(metricId); mid != "" {
+		parts = append(parts, mid)
+	}
+	return strings.Join(parts, "_")
+}
+
+// metricReportDescriptor returns the descriptor and value type for a telemetry
+// metric. Both are derived from the same sanitized MetricId so the emitted
+// family name, help string and value type always agree. The help string is
+// derived from the sanitized name before the counter suffix so that MetricIds
+// which differ only in case or punctuation (and therefore collapse into the
+// same metric family) produce an identical help string. A mismatch would make
+// registry.Gather() fail.
+func metricReportDescriptor(metricId string) (*prometheus.Desc, prometheus.ValueType) {
+	mid := sanitizeMetricName(metricId)
+	desc := prometheus.NewDesc(
+		metricReportFamilyName(metricId),
+		fmt.Sprintf("Metric report %s %s", metricHelpKind(mid), mid),
+		[]string{"metric_report_id", "context", "fqdd"},
+		nil,
+	)
+	return desc, ClassifyMetric(mid).ValueType()
+}
+
+// NewMetricReportEntry emits a single telemetry metric. Unlike the static
+// collectors it returns an error instead of panicking, because the descriptor
+// and label values are derived from BMC-supplied data and may be invalid.
+// Callers are expected to log the failure and count it as a scrape error.
+func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricReportId, metricId string, contextId, fqdd *string, value float64) error {
 	// Convert nil pointers to empty strings for label values.
 	ctx := ""
 	if contextId != nil {
@@ -1080,58 +1152,19 @@ func (mc *Collector) NewMetricReportEntry(ch chan<- prometheus.Metric, metricRep
 	if fqdd != nil {
 		fq = *fqdd
 	}
-	// source and label removed — not emitted as labels. The Dell OEM Label is
-	// always "<ContextID> <MetricId>", so it is fully derivable from the
-	// context label and the metric family name.
+	// source and label are not emitted as labels. The Dell OEM Label is always
+	// "<ContextID> <MetricId>", so it is fully derivable from the context label
+	// and the metric family name.
 
-	mid := sanitizeMetricName(metricId)
+	desc, valueType := metricReportDescriptor(metricId)
 
-	// Classify the metric so it is exposed with the correct Prometheus value
-	// type. Counters additionally follow the Prometheus naming convention and
-	// get a "_total" suffix, unless the name already carries a counter-style
-	// suffix ("_total" or "_count").
-	metricType := ClassifyMetric(mid)
-	if metricType == MetricTypeCounter &&
-		!strings.HasSuffix(mid, "_total") &&
-		!strings.HasSuffix(mid, "_count") {
-		mid += "_total"
+	m, err := prometheus.NewConstMetric(desc, valueType, value, metricReportId, ctx, fq)
+	if err != nil {
+		return err
 	}
 
-	// Build metric family name as: <prefix>_telemetry_<metricId>
-	parts := []string{}
-	// Check the configured prefix before sanitizing: sanitizeMetricName("")
-	// returns "metric", which would otherwise leak into the family name.
-	if config.Config.MetricsPrefix != "" {
-		if p := sanitizeMetricName(config.Config.MetricsPrefix); p != "" {
-			parts = append(parts, p)
-			parts = append(parts, "telemetry")
-		}
-	}
-	if mid != "" {
-		parts = append(parts, mid)
-	}
-	fqName := strings.Join(parts, "_")
-
-	// Determine help kind from the sanitized name so that MetricIds which
-	// differ only in case or punctuation (and therefore collapse into the same
-	// metric family) produce an identical help string. A mismatch would make
-	// registry.Gather() fail.
-	helpKind := metricHelpKind(mid)
-	desc := prometheus.NewDesc(
-		fqName,
-		fmt.Sprintf("Metric report %s %s", helpKind, mid),
-		[]string{"metric_report_id", "context", "fqdd"},
-		nil,
-	)
-
-	ch <- prometheus.MustNewConstMetric(
-		desc,
-		metricType.ValueType(),
-		value,
-		metricReportId,
-		ctx,
-		fq,
-	)
+	ch <- m
+	return nil
 }
 
 // sanitizeMetricName converts an arbitrary string to a valid Prometheus
